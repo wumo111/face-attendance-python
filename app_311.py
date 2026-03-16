@@ -41,6 +41,7 @@ app = Flask(__name__)
 detector = None
 sp = None
 facerec = None
+opencv_detector = None
 known_faces_cache = []
 last_update_time = 0.0
 last_attendance = {}
@@ -68,12 +69,12 @@ def api_extract_feature():
         img_bgr = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
         if img_bgr is None:
             return jsonify({"code": 400, "msg": "Invalid image"}), 400
-        img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-        img_rgb = np.ascontiguousarray(img_rgb, dtype=np.uint8)
-        dets = detector(img_rgb, 1)
+        dets = detect_faces(img_bgr)
         if len(dets) == 0:
             return jsonify({"code": 400, "msg": "No face detected"}), 400
         det = max(dets, key=lambda r: r.width() * r.height())
+        img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+        img_rgb = np.ascontiguousarray(img_rgb, dtype=np.uint8)
         feature = get_face_feature(img_rgb, det)
         if feature is None:
             return jsonify({"code": 500, "msg": "Feature extraction failed"}), 500
@@ -99,12 +100,16 @@ def download_and_extract_model(url, save_path):
 
 
 def load_models():
-    global detector, sp, facerec
+    global detector, sp, facerec, opencv_detector
     download_and_extract_model(MODEL_URLS["shape_predictor"], MODEL_PATHS["shape_predictor"])
     download_and_extract_model(MODEL_URLS["face_recognition"], MODEL_PATHS["face_recognition"])
     detector = dlib.get_frontal_face_detector()
     sp = dlib.shape_predictor(MODEL_PATHS["shape_predictor"])
     facerec = dlib.face_recognition_model_v1(MODEL_PATHS["face_recognition"])
+    cascade_path = os.path.join(cv2.data.haarcascades, "haarcascade_frontalface_default.xml")
+    opencv_detector = cv2.CascadeClassifier(cascade_path)
+    if opencv_detector.empty():
+        raise RuntimeError("OpenCV cascade load failed")
 
 
 def get_face_feature(img_rgb, det):
@@ -113,7 +118,24 @@ def get_face_feature(img_rgb, det):
         descriptor = facerec.compute_face_descriptor(img_rgb, shape)
         return np.array(descriptor, dtype=np.float64)
     except Exception:
-        return None
+        try:
+            gray = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2GRAY)
+            gray = np.ascontiguousarray(gray, dtype=np.uint8)
+            shape = sp(gray, det)
+            descriptor = facerec.compute_face_descriptor(img_rgb, shape)
+            return np.array(descriptor, dtype=np.float64)
+        except Exception:
+            return None
+
+
+def detect_faces(frame_bgr):
+    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+    gray = np.ascontiguousarray(gray, dtype=np.uint8)
+    boxes = opencv_detector.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(60, 60))
+    dets = []
+    for x, y, w, h in boxes:
+        dets.append(dlib.rectangle(int(x), int(y), int(x + w), int(y + h)))
+    return dets
 
 
 def parse_feature(feature_value):
@@ -210,11 +232,7 @@ def run_camera():
         img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         img_rgb = np.ascontiguousarray(img_rgb, dtype=np.uint8)
 
-        try:
-            dets = detector(img_rgb, 0)
-        except Exception as e:
-            print(f"dlib detect error: {e}")
-            dets = []
+        dets = detect_faces(frame)
 
         update_known_faces()
 

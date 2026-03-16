@@ -7,3 +7,4 @@ models/
 .idea/
 .vscode/
 *.log
+venv311
