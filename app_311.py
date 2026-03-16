@@ -24,6 +24,7 @@ MYSQL_USER = os.getenv("MYSQL_USER", "root")
 MYSQL_PASSWORD = os.getenv("MYSQL_PASSWORD", "root")
 MYSQL_DB = os.getenv("MYSQL_DB", "face_attendance")
 FEATURE_BACKFILL_INTERVAL = int(os.getenv("FEATURE_BACKFILL_INTERVAL", "30"))
+ATTENDANCE_INTERVAL = int(os.getenv("ATTENDANCE_INTERVAL", "300"))
 FACE_MATCH_THRESHOLD = float(os.getenv("FACE_MATCH_THRESHOLD", "0.48"))
 FACE_MATCH_MARGIN = float(os.getenv("FACE_MATCH_MARGIN", "0.05"))
 PYTHON_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -509,7 +510,7 @@ def run_camera():
                     name = emp.get("name") or "未知"
                     color = (0, 255, 0)
                     last_ts = last_attendance.get(emp_id, 0.0)
-                    if time.time() - last_ts >= 3:
+                    if time.time() - last_ts >= ATTENDANCE_INTERVAL:
                         cap_name = f"{ts}_{emp_id}.jpg"
                         cap_path = os.path.join(DIRS["captures"], cap_name)
                         cv2.imwrite(cap_path, frame)
@@ -522,6 +523,9 @@ def run_camera():
                         post_capture(emp_id, f"data/captures/{cap_name}", 1.0 - min(dist, 1.0))
                         last_attendance[emp_id] = time.time()
                         frame = draw_text(frame, f"打卡成功：{name}", (10, 10), (0, 255, 0), 32)
+                    else:
+                        # 已经打过卡，仅显示姓名，不重复记录和截图
+                        name = f"{name} (已打卡)"
 
             cv2.rectangle(frame, (l, t), (l + w, t + h), color, 2)
             frame = draw_text(frame, name, (l, max(0, t - 36)), color, 28)
