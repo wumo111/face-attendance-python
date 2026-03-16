@@ -10,8 +10,22 @@ import dlib
 import numpy as np
 import requests
 from flask import Flask, jsonify, request
+from PIL import Image, ImageDraw, ImageFont
 
-JAVA_API_BASE = "http://localhost:8080/api"
+try:
+    import pymysql
+except Exception:
+    pymysql = None
+
+JAVA_API_BASE = os.getenv("JAVA_API_BASE", "http://localhost:8080/api")
+MYSQL_HOST = os.getenv("MYSQL_HOST", "127.0.0.1")
+MYSQL_PORT = int(os.getenv("MYSQL_PORT", "3306"))
+MYSQL_USER = os.getenv("MYSQL_USER", "root")
+MYSQL_PASSWORD = os.getenv("MYSQL_PASSWORD", "root")
+MYSQL_DB = os.getenv("MYSQL_DB", "face_attendance")
+FEATURE_BACKFILL_INTERVAL = int(os.getenv("FEATURE_BACKFILL_INTERVAL", "30"))
+FACE_MATCH_THRESHOLD = float(os.getenv("FACE_MATCH_THRESHOLD", "0.48"))
+FACE_MATCH_MARGIN = float(os.getenv("FACE_MATCH_MARGIN", "0.05"))
 PYTHON_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(PYTHON_BASE_DIR)
 DATA_DIR = os.path.join(PROJECT_ROOT, "data")
@@ -45,6 +59,9 @@ opencv_detector = None
 known_faces_cache = []
 last_update_time = 0.0
 last_attendance = {}
+last_java_api_error_time = 0.0
+last_backfill_error_time = 0.0
+font_cache = {}
 
 
 @app.after_request
@@ -55,18 +72,54 @@ def add_cors_headers(response):
     return response
 
 
+def get_cn_font(size):
+    if size in font_cache:
+        return font_cache[size]
+    candidates = [
+        os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts", "msyh.ttc"),
+        os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts", "simhei.ttf"),
+        os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts", "simsun.ttc"),
+    ]
+    for path in candidates:
+        if os.path.exists(path):
+            try:
+                font = ImageFont.truetype(path, size=size, encoding="utf-8")
+                font_cache[size] = font
+                return font
+            except Exception:
+                pass
+    font = ImageFont.load_default()
+    font_cache[size] = font
+    return font
+
+
+def draw_text(frame_bgr, text, org, color, size):
+    x, y = int(org[0]), int(org[1])
+    pil_img = Image.fromarray(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))
+    draw = ImageDraw.Draw(pil_img)
+    draw.text((x, y), str(text), font=get_cn_font(size), fill=(int(color[2]), int(color[1]), int(color[0])))
+    return cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+
+
 @app.route("/extract_feature", methods=["POST", "OPTIONS"])
 def api_extract_feature():
     if request.method == "OPTIONS":
         return ("", 204)
     try:
-        data = request.get_json(silent=True) or {}
-        img_b64 = data.get("image")
-        if not img_b64:
-            return jsonify({"code": 400, "msg": "No image provided"}), 400
-        img_bytes = base64.b64decode(img_b64)
-        nparr = np.frombuffer(img_bytes, np.uint8)
-        img_bgr = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        img_bgr = None
+        upload_file = request.files.get("file")
+        if upload_file is not None:
+            img_bytes = upload_file.read()
+            nparr = np.frombuffer(img_bytes, np.uint8)
+            img_bgr = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        else:
+            data = request.get_json(silent=True) or {}
+            img_b64 = data.get("image")
+            if not img_b64:
+                return jsonify({"code": 400, "msg": "No image provided"}), 400
+            img_bytes = base64.b64decode(img_b64)
+            nparr = np.frombuffer(img_bytes, np.uint8)
+            img_bgr = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
         if img_bgr is None:
             return jsonify({"code": 400, "msg": "Invalid image"}), 400
         dets = detect_faces(img_bgr)
@@ -79,7 +132,7 @@ def api_extract_feature():
         if feature is None:
             return jsonify({"code": 500, "msg": "Feature extraction failed"}), 500
         feature_str = ",".join(map(str, feature.tolist()))
-        return jsonify({"feature": feature_str})
+        return jsonify({"code": 200, "msg": "success", "data": feature_str, "feature": feature_str})
     except Exception as e:
         return jsonify({"code": 500, "msg": str(e)}), 500
 
@@ -113,6 +166,15 @@ def load_models():
 
 
 def get_face_feature(img_rgb, det):
+    h, w = img_rgb.shape[:2]
+    det = dlib.rectangle(
+        max(0, min(det.left(), w - 1)),
+        max(0, min(det.top(), h - 1)),
+        max(1, min(det.right(), w - 1)),
+        max(1, min(det.bottom(), h - 1)),
+    )
+    if det.right() <= det.left() or det.bottom() <= det.top():
+        return None
     try:
         shape = sp(img_rgb, det)
         descriptor = facerec.compute_face_descriptor(img_rgb, shape)
@@ -128,14 +190,80 @@ def get_face_feature(img_rgb, det):
             return None
 
 
-def detect_faces(frame_bgr):
+def detect_faces(frame_bgr, min_side=60):
+    if frame_bgr is None or getattr(frame_bgr, "size", 0) == 0:
+        return []
+    if len(frame_bgr.shape) < 2:
+        return []
+    h, w = frame_bgr.shape[:2]
+    if h < min_side or w < min_side:
+        return []
     gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
     gray = np.ascontiguousarray(gray, dtype=np.uint8)
-    boxes = opencv_detector.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(60, 60))
+    try:
+        boxes = opencv_detector.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(min_side, min_side))
+    except cv2.error:
+        return []
     dets = []
     for x, y, w, h in boxes:
-        dets.append(dlib.rectangle(int(x), int(y), int(x + w), int(y + h)))
+        l = int(x)
+        t = int(y)
+        r = int(x + w - 1)
+        b = int(y + h - 1)
+        l = max(0, min(l, gray.shape[1] - 1))
+        t = max(0, min(t, gray.shape[0] - 1))
+        r = max(l + 1, min(r, gray.shape[1] - 1))
+        b = max(t + 1, min(b, gray.shape[0] - 1))
+        dets.append(dlib.rectangle(l, t, r, b))
     return dets
+
+
+def extract_feature_from_bgr(img_bgr, require_single_face=False):
+    if img_bgr is None:
+        return None
+    h, w = img_bgr.shape[:2]
+    img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+    img_rgb = np.ascontiguousarray(img_rgb, dtype=np.uint8)
+
+    dets = detect_faces(img_bgr, 60)
+    if len(dets) == 0:
+        dets = detect_faces(img_bgr, 30)
+    if len(dets) == 0:
+        scale = 1.6
+        up_w = max(int(w * scale), 1)
+        up_h = max(int(h * scale), 1)
+        upscaled = cv2.resize(img_bgr, (up_w, up_h), interpolation=cv2.INTER_CUBIC)
+        upscaled_dets = detect_faces(upscaled, 60)
+        converted = []
+        for det in upscaled_dets:
+            l = int(det.left() / scale)
+            t = int(det.top() / scale)
+            r = int(det.right() / scale)
+            b = int(det.bottom() / scale)
+            l = max(0, min(l, w - 1))
+            t = max(0, min(t, h - 1))
+            r = max(l + 1, min(r, w - 1))
+            b = max(t + 1, min(b, h - 1))
+            converted.append(dlib.rectangle(l, t, r, b))
+        dets = converted
+    if len(dets) == 0 and detector is not None:
+        try:
+            gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+            gray = np.ascontiguousarray(gray, dtype=np.uint8)
+            dets = detector(gray, 1)
+        except Exception:
+            dets = []
+    if len(dets) == 0 and detector is not None:
+        try:
+            dets = detector(img_rgb, 1)
+        except Exception:
+            dets = []
+    if len(dets) == 0:
+        return None
+    if require_single_face and len(dets) != 1:
+        return None
+    det = max(dets, key=lambda r: r.width() * r.height())
+    return get_face_feature(img_rgb, det)
 
 
 def parse_feature(feature_value):
@@ -154,7 +282,7 @@ def parse_feature(feature_value):
 
 
 def update_known_faces():
-    global known_faces_cache, last_update_time
+    global known_faces_cache, last_update_time, last_java_api_error_time
     if time.time() - last_update_time < 15:
         return
     try:
@@ -173,20 +301,28 @@ def update_known_faces():
             parsed.append({"id": emp.get("id"), "name": emp.get("name", "未知"), "vector": vec})
         known_faces_cache = parsed
         last_update_time = time.time()
+        last_java_api_error_time = 0.0
         print(f"Updated known faces: {len(known_faces_cache)} employees")
     except Exception as e:
-        print(f"Failed to update known faces: {e}")
+        now = time.time()
+        if now - last_java_api_error_time >= 30:
+            last_java_api_error_time = now
+            print(f"Java API unavailable: {JAVA_API_BASE}. Start Java backend on port 8080. detail={e}")
 
 
 def recognize_face(face_vector):
     best_emp = None
     best_dist = 10.0
+    second_dist = 10.0
     for emp in known_faces_cache:
         dist = np.linalg.norm(face_vector - emp["vector"])
         if dist < best_dist:
+            second_dist = best_dist
             best_dist = dist
             best_emp = emp
-    if best_emp is not None and best_dist < 0.6:
+        elif dist < second_dist:
+            second_dist = dist
+    if best_emp is not None and best_dist < FACE_MATCH_THRESHOLD and (second_dist - best_dist) >= FACE_MATCH_MARGIN:
         return best_emp, best_dist
     return None, best_dist
 
@@ -205,6 +341,102 @@ def post_capture(employee_id, image_url, score):
         requests.post(f"{JAVA_API_BASE}/capture/save", json=payload, timeout=2)
     except Exception as e:
         print(f"API Error (capture): {e}")
+
+
+def resolve_photo_path(photo_url):
+    if not photo_url:
+        return None
+    normalized = str(photo_url).replace("/", os.sep).replace("\\", os.sep)
+    normalized = os.path.normpath(normalized)
+    if os.path.isabs(normalized) and os.path.exists(normalized):
+        return normalized
+    if normalized.lower().startswith(("data" + os.sep).lower()):
+        project_relative = os.path.join(PROJECT_ROOT, normalized)
+        if os.path.exists(project_relative):
+            return project_relative
+    candidates = [
+        normalized,
+        os.path.join(PROJECT_ROOT, normalized),
+        os.path.join(PYTHON_BASE_DIR, normalized),
+        os.path.join(DATA_DIR, normalized),
+        os.path.join(DATA_DIR, "faces", os.path.basename(normalized)),
+        os.path.join(DATA_DIR, os.path.basename(normalized)),
+    ]
+    for path in candidates:
+        if os.path.exists(path):
+            return path
+    return None
+
+
+def create_mysql_conn():
+    if pymysql is None:
+        return None
+    return pymysql.connect(
+        host=MYSQL_HOST,
+        port=MYSQL_PORT,
+        user=MYSQL_USER,
+        password=MYSQL_PASSWORD,
+        database=MYSQL_DB,
+        charset="utf8mb4",
+        cursorclass=pymysql.cursors.DictCursor,
+        autocommit=False,
+    )
+
+
+def backfill_features_once(conn):
+    updated = 0
+    skipped = 0
+    with conn.cursor() as cursor:
+        cursor.execute(
+            "SELECT id, photo_url FROM employee WHERE feature IS NULL OR TRIM(feature) = ''"
+        )
+        rows = cursor.fetchall()
+        for row in rows:
+            emp_id = row.get("id")
+            photo_url = row.get("photo_url")
+            photo_path = resolve_photo_path(photo_url)
+            if not photo_path:
+                print(f"Backfill skip employee={emp_id}: photo not found, photo_url={photo_url}")
+                skipped += 1
+                continue
+            img_bgr = cv2.imread(photo_path)
+            feature = extract_feature_from_bgr(img_bgr, require_single_face=True)
+            if feature is None:
+                print(f"Backfill skip employee={emp_id}: no valid face, photo_path={photo_path}")
+                skipped += 1
+                continue
+            feature_str = ",".join(map(str, feature.tolist()))
+            cursor.execute("UPDATE employee SET feature=%s WHERE id=%s", (feature_str, emp_id))
+            updated += 1
+    conn.commit()
+    return updated, skipped
+
+
+def feature_backfill_worker():
+    global last_backfill_error_time
+    if pymysql is None:
+        print("PyMySQL not installed. Feature backfill worker disabled.")
+        return
+    conn = None
+    while True:
+        try:
+            if conn is None:
+                conn = create_mysql_conn()
+            updated, skipped = backfill_features_once(conn)
+            if updated > 0 or skipped > 0:
+                print(f"Feature backfill: updated={updated}, skipped={skipped}")
+        except Exception as e:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                conn = None
+            now = time.time()
+            if now - last_backfill_error_time >= 30:
+                last_backfill_error_time = now
+                print(f"Feature backfill worker error: {e}")
+        time.sleep(max(FEATURE_BACKFILL_INTERVAL, 5))
 
 
 def run_camera():
@@ -289,10 +521,10 @@ def run_camera():
                         post_attendance(emp_id)
                         post_capture(emp_id, f"data/captures/{cap_name}", 1.0 - min(dist, 1.0))
                         last_attendance[emp_id] = time.time()
-                        cv2.putText(frame, f"打卡成功：{name}", (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+                        frame = draw_text(frame, f"打卡成功：{name}", (10, 10), (0, 255, 0), 32)
 
             cv2.rectangle(frame, (l, t), (l + w, t + h), color, 2)
-            cv2.putText(frame, name, (l, max(20, t - 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+            frame = draw_text(frame, name, (l, max(0, t - 36)), color, 28)
 
         cv2.imshow("Face Attendance System", frame)
         if cv2.waitKey(1) & 0xFF == ord("q"):
@@ -310,6 +542,8 @@ def start_flask():
 
 if __name__ == "__main__":
     load_models()
+    backfill_thread = threading.Thread(target=feature_backfill_worker, daemon=True)
+    backfill_thread.start()
     flask_thread = threading.Thread(target=start_flask, daemon=True)
     flask_thread.start()
     run_camera()
