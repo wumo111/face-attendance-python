@@ -45,9 +45,12 @@ app = Flask(__name__)
 detector = None
 sp = None
 facerec = None
+opencv_detector = None
 known_faces_cache = [] # List of {id, name, feature_vector}
 last_update_time = 0
 last_attendance = {} # {employee_id: timestamp}
+dlib_feature_available = True
+dlib_feature_error = ""
 
 # --- Helper Functions ---
 
@@ -83,7 +86,7 @@ def download_and_extract_model(url, save_path):
         pass
 
 def load_models():
-    global detector, sp, facerec
+    global detector, sp, facerec, opencv_detector
     
     # Check and download
     download_and_extract_model(MODEL_URLS["shape_predictor"], MODEL_PATHS["shape_predictor"])
@@ -97,18 +100,29 @@ def load_models():
     detector = dlib.get_frontal_face_detector()
     sp = dlib.shape_predictor(MODEL_PATHS["shape_predictor"])
     facerec = dlib.face_recognition_model_v1(MODEL_PATHS["face_recognition"])
+    cascade_path = os.path.join(cv2.data.haarcascades, "haarcascade_frontalface_default.xml")
+    opencv_detector = cv2.CascadeClassifier(cascade_path)
+    if opencv_detector.empty():
+        print("CRITICAL ERROR: OpenCV face detector load failed.")
+        return False
     print("Models loaded.")
     return True
 
 def get_face_feature(img_rgb, det):
-    """Extract 128D feature vector from a face detection"""
-    shape = sp(img_rgb, det)
-    face_chip = dlib.get_face_chip(img_rgb, shape) # Optional: Align face
-    # Or directly compute:
-    # face_descriptor = facerec.compute_face_descriptor(img_rgb, shape)
-    # Using aligned face chip is usually better
-    face_descriptor = facerec.compute_face_descriptor(face_chip)
-    return np.array(face_descriptor)
+    global dlib_feature_available, dlib_feature_error
+    if not dlib_feature_available:
+        return None
+    img_rgb = np.ascontiguousarray(img_rgb, dtype=np.uint8)
+    try:
+        shape = sp(img_rgb, det)
+        face_chip = dlib.get_face_chip(img_rgb, shape)
+        face_descriptor = facerec.compute_face_descriptor(face_chip)
+        return np.array(face_descriptor)
+    except Exception as e:
+        dlib_feature_available = False
+        dlib_feature_error = str(e)
+        print(f"dlib feature extractor disabled: {dlib_feature_error}")
+        return None
 
 def update_known_faces():
     """Fetch employee features from Java backend"""
@@ -159,6 +173,15 @@ def recognize_face(face_vector):
         return match_emp, min_dist
     return None, min_dist
 
+def detect_faces(frame_bgr):
+    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+    gray = np.ascontiguousarray(gray, dtype=np.uint8)
+    boxes = opencv_detector.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(60, 60))
+    dets = []
+    for x, y, w, h in boxes:
+        dets.append(dlib.rectangle(int(x), int(y), int(x + w), int(y + h)))
+    return dets
+
 # --- Flask Routes ---
 
 @app.route('/extract_feature', methods=['POST'])
@@ -177,9 +200,7 @@ def api_extract_feature():
         if img is None:
             return jsonify({"code": 400, "msg": "Invalid image"}), 400
             
-        # Detect face (assume single face for registration)
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        dets = detector(gray, 1)
+        dets = detect_faces(img)
         
         if len(dets) == 0:
             return jsonify({"code": 400, "msg": "No face detected"}), 400
@@ -188,6 +209,8 @@ def api_extract_feature():
         det = max(dets, key=lambda r: r.width() * r.height())
         img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         feature = get_face_feature(img_rgb, det)
+        if feature is None:
+            return jsonify({"code": 503, "msg": f"dlib unavailable: {dlib_feature_error}"}), 503
         
         # Convert to comma-separated string
         feature_str = ",".join(map(str, feature.tolist()))
@@ -216,20 +239,25 @@ def run_camera():
     recording = False
     video_writer = None
     no_face_start_time = None
+    dlib_error_notified = False
     
     print("Camera started. Press 'q' to quit.")
     
     while True:
         ret, frame = cap.read()
         if not ret:
+            print("Failed to grab frame")
             break
+
+        # Ensure frame is valid and has correct type (uint8)
+        if frame is None or frame.size == 0:
+            continue
             
-        # Resize for speed (optional)
-        # small_frame = cv2.resize(frame, (0, 0), fx=0.5, fy=0.5)
-        
-        # Detection
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        dets = detector(gray, 0) # 0 for faster, less small faces
+        # Convert to standard format if needed (OpenCV usually returns BGR uint8)
+        if frame.dtype != np.uint8:
+            frame = frame.astype(np.uint8)
+            
+        dets = detect_faces(frame)
         
         now = datetime.now()
         timestamp_str = now.strftime("%Y%m%d_%H%M%S")
@@ -262,13 +290,21 @@ def run_camera():
         if recording and video_writer:
             video_writer.write(frame)
             
+        img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        img_rgb = np.ascontiguousarray(img_rgb, dtype=np.uint8)
+
         # Processing Faces
         for det in dets:
             x, y, w, h = det.left(), det.top(), det.width(), det.height()
             
-            # Extract Feature
-            img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             feature = get_face_feature(img_rgb, det)
+            if feature is None:
+                if not dlib_error_notified:
+                    print(f"dlib unavailable, recognition skipped: {dlib_feature_error}")
+                    dlib_error_notified = True
+                cv2.rectangle(frame, (x, y), (x+w, y+h), (0, 255, 255), 2)
+                cv2.putText(frame, "DlibError", (x, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
+                continue
             
             # Recognition
             match_emp, dist = recognize_face(feature)
@@ -329,6 +365,8 @@ def run_camera():
             cv2.putText(frame, name, (x, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
 
         # Show Frame
+        if not dlib_feature_available:
+            cv2.putText(frame, "dlib unavailable", (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
         cv2.imshow('Face Attendance System', frame)
         
         if cv2.waitKey(1) & 0xFF == ord('q'):
