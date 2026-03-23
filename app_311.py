@@ -63,6 +63,8 @@ last_attendance = {}
 last_java_api_error_time = 0.0
 last_backfill_error_time = 0.0
 font_cache = {}
+latest_frame = None
+frame_lock = threading.Lock()
 
 
 @app.after_request
@@ -136,6 +138,28 @@ def api_extract_feature():
         return jsonify({"code": 200, "msg": "success", "data": feature_str, "feature": feature_str})
     except Exception as e:
         return jsonify({"code": 500, "msg": str(e)}), 500
+
+
+def generate_frames():
+    while True:
+        with frame_lock:
+            if latest_frame is None:
+                time.sleep(0.1)
+                continue
+            ret, buffer = cv2.imencode('.jpg', latest_frame)
+            if not ret:
+                continue
+            frame_bytes = buffer.tobytes()
+        yield (b'--frame\r\n'
+               b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
+
+
+@app.route('/video_feed')
+def video_feed():
+    return app.response_class(
+        generate_frames(),
+        mimetype='multipart/x-mixed-replace; boundary=frame'
+    )
 
 
 def download_and_extract_model(url, save_path):
@@ -529,6 +553,10 @@ def run_camera():
 
             cv2.rectangle(frame, (l, t), (l + w, t + h), color, 2)
             frame = draw_text(frame, name, (l, max(0, t - 36)), color, 28)
+
+        with frame_lock:
+            global latest_frame
+            latest_frame = frame.copy()
 
         cv2.imshow("Face Attendance System", frame)
         if cv2.waitKey(1) & 0xFF == ord("q"):
